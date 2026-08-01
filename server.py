@@ -215,9 +215,11 @@ async def _fetch_around(
     try:
         places = json.loads(base64.b64decode(resp.text, validate=True))
     except Exception as e:
+        # The body snippet goes to stderr only. Returned strings reach the LLM,
+        # and upstream content is untrusted (prompt-injection vector).
         snippet = resp.text[:100].replace("\n", " ")
-        error = f"undecodable response at {where}: {type(e).__name__}: {e} | body starts: {snippet!r}"
-        print(f"[park4night] fetch_around {error}", file=sys.stderr)
+        error = f"undecodable response at {where}: {type(e).__name__}: {e}"
+        print(f"[park4night] fetch_around {error} | body starts: {snippet!r}", file=sys.stderr)
         return [], error
 
     if not isinstance(places, list):
@@ -427,19 +429,32 @@ async def get_reviews(place_id: int) -> str:
     try:
         raw = resp.json()
     except Exception as e:
+        # Snippet to stderr only — see the note in _fetch_around.
         snippet = resp.text[:100].replace("\n", " ")
+        print(
+            f"[park4night] get_reviews unparseable response for place {place_id}: "
+            f"{type(e).__name__}: {e} | body starts: {snippet!r}",
+            file=sys.stderr,
+        )
         return (
-            f"Park4Night API error: could not parse the review response for place {place_id}: "
-            f"{type(e).__name__}: {e} | body starts: {snippet!r}"
+            f"Park4Night API error: could not parse the review response for place {place_id} "
+            f"({type(e).__name__}). This is an upstream problem — it does NOT mean the spot "
+            f"has no reviews."
         )
 
-    # Handle both list and dict responses
+    # Handle both list and dict responses; anything else falls to the guard below
     if isinstance(raw, dict):
         reviews_data = raw.get("commentaires", raw.get("comments", []))
-    elif isinstance(raw, list):
-        reviews_data = raw
     else:
-        reviews_data = []
+        reviews_data = raw
+
+    if not isinstance(reviews_data, list):
+        # Falling through to "no reviews" here would hide an upstream schema change.
+        return (
+            f"Park4Night API error: unexpected review payload for place {place_id} — expected a "
+            f"list of reviews, got {type(reviews_data).__name__}. This is an upstream problem — "
+            f"it does NOT mean the spot has no reviews."
+        )
 
     if not reviews_data:
         return f"No reviews found for place ID {place_id}"
