@@ -129,9 +129,11 @@ Linear interpolation between two GPS points, returning at least 2 points and rou
 
 Builds the sample grid. Always returns the center point. For `radius_km >= 15`, adds one ring of 4 cardinal-direction points. For `radius_km >= 35`, adds a second ring. For `radius_km >= 60`, adds a third ring. Per ring, the offset is computed in degrees-per-km using `cos(lat)` to compensate for the longitude convergence at higher latitudes.
 
-#### `async _fetch_around(client, lat, lon, radius) -> list[dict]`
+#### `async _fetch_around(client, lat, lon, radius) -> tuple[list[dict], str | None]`
 
-Single-call wrapper around `GET /api/places/around` with base64 decoding. Swallows all exceptions and returns `[]` on error so one bad grid point doesn't break the whole batch.
+Single-call wrapper around `GET /api/places/around` with base64 decoding. Returns `(places, error)`. A non-200 status, a transport error, an undecodable body, or a non-list payload each yield `([], "<description>")` rather than raising, so one bad grid point doesn't break the whole batch — but the caller can still tell a failure apart from a genuinely empty area.
+
+Callers aggregate the errors: if *every* query point failed they return an explicit "Park4Night API error" message, and if only some failed they prepend a `WARNING:` line to the results. Reporting an upstream outage as `Found 0 spots` is what previously made a total API block look like "this country has no spots".
 
 ### Constants
 
@@ -141,6 +143,7 @@ Single-call wrapper around `GET /api/places/around` with base64 decoding. Swallo
 | `API_PLACE` | `https://park4night.com/api/places` | Reserved for single-place lookup (not currently called by any tool) |
 | `API_REVIEWS` | `https://guest.park4night.com/services/V4.1/commGet.php` | Legacy reviews endpoint, returns plain JSON |
 | `TIMEOUT` | `15.0` | httpx timeout in seconds, applied to every call |
+| `HEADERS` | dict, 2 entries | Identifying `User-Agent` (client name + repo URL) and `Accept`; Park4Night 403s the default `python-httpx/x.y` agent |
 | `TYPE_CODES` | dict, 24 entries | Maps Park4Night type codes (P, ACS, PN, etc.) to readable labels |
 | `SERVICE_LABELS` | dict, 11 entries | Maps service codes to readable labels (currently unused — services come back from the API with `label` fields already, but kept for fallback) |
 
@@ -172,7 +175,8 @@ To tune behavior, edit `server.py`:
 - **No real road routing.** `search_along_route` uses straight-line interpolation. For routes through complex geography (Alps, Norwegian fjords) the corridor will miss spots reachable by road but far from the bee-line.
 - **No pricing data.** The list endpoint returns `price: "free"` for everything because the field isn't included in the around-search response. The detail endpoint (`API_PLACE`) likely has it but isn't currently called.
 - **Reviews endpoint is legacy.** `commGet.php` is the older guest API. If Park4Night decommissions the guest service, `get_reviews` will need to migrate to the website API equivalent.
-- **No retries.** A failed grid point is silently dropped. Adding `httpx-retries` or a manual retry loop would improve robustness in flaky network conditions.
+- **No retries.** A failed grid point is dropped (and reported in the output, but not retried). Adding `httpx-retries` or a manual retry loop would improve robustness in flaky network conditions.
+- **Bot filtering.** Park4Night returns `403 Forbidden` to requests carrying httpx's default `python-httpx/x.y` User-Agent. The server sends an identifying `User-Agent` naming this client and linking the repository (`HEADERS`) — that is enough, no browser impersonation needed. If 403s return, the block has moved beyond User-Agent matching — likely TLS/JA3 fingerprinting or IP reputation, neither of which a header tweak can fix.
 - **Result rendering is fixed.** Output is human-readable Markdown. Clients that want structured JSON would need a thin adapter — easy to add as a fourth tool.
 
 ---

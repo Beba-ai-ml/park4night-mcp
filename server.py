@@ -187,19 +187,54 @@ def _generate_grid(lat: float, lon: float, radius_km: float) -> list[tuple[float
     return [(round(p[0], 5), round(p[1], 5)) for p in points]
 
 
-async def _fetch_around(client: httpx.AsyncClient, lat: float, lon: float, radius: float) -> list[dict]:
-    """Fetch places from the website API (base64-encoded response)."""
+async def _fetch_around(
+    client: httpx.AsyncClient, lat: float, lon: float, radius: float
+) -> tuple[list[dict], str | None]:
+    """Fetch places from the website API (base64-encoded response).
+
+    Returns (places, error). A failed query yields an error string rather than
+    an empty list, so callers can tell "upstream is down" apart from "this area
+    genuinely has no spots" — reporting the former as 0 results hides outages.
+    """
+    where = f"({lat}, {lon})"
     try:
         resp = await client.get(
             API_AROUND,
             params={"lat": lat, "lng": lon, "radius": radius},
         )
-        resp.raise_for_status()
-        decoded = base64.b64decode(resp.text)
-        return json.loads(decoded)
     except Exception as e:
-        print(f"[park4night] fetch_around failed at ({lat}, {lon}): {e}", file=sys.stderr)
-        return []
+        error = f"request failed at {where}: {type(e).__name__}: {e}"
+        print(f"[park4night] fetch_around {error}", file=sys.stderr)
+        return [], error
+
+    if resp.status_code != 200:
+        error = f"HTTP {resp.status_code} at {where}"
+        print(f"[park4night] fetch_around {error}", file=sys.stderr)
+        return [], error
+
+    try:
+        places = json.loads(base64.b64decode(resp.text, validate=True))
+    except Exception as e:
+        snippet = resp.text[:100].replace("\n", " ")
+        error = f"undecodable response at {where}: {type(e).__name__}: {e} | body starts: {snippet!r}"
+        print(f"[park4night] fetch_around {error}", file=sys.stderr)
+        return [], error
+
+    if not isinstance(places, list):
+        error = f"expected a list of places at {where}, got {type(places).__name__}"
+        print(f"[park4night] fetch_around {error}", file=sys.stderr)
+        return [], error
+
+    return places, None
+
+
+def _upstream_failure_message(failures: list[str], attempted: int) -> str:
+    """Message for the case where every upstream query failed."""
+    return (
+        f"Park4Night API error: all {attempted} query point(s) failed, so nothing could be "
+        f"retrieved. This is an upstream problem — it does NOT mean the area has no spots.\n"
+        f"First error: {failures[0]}"
+    )
 
 
 @mcp.tool()
@@ -223,7 +258,11 @@ async def search_places(latitude: float, longitude: float, radius_km: float = 30
         tasks = [_fetch_around(client, lat, lon, radius_km) for lat, lon in grid]
         results = await asyncio.gather(*tasks)
 
-    for raw_places in results:
+    failures = [error for _, error in results if error]
+    if failures and len(failures) == len(grid):
+        return _upstream_failure_message(failures, len(grid))
+
+    for raw_places, _ in results:
         for p in raw_places:
             pid = p.get("id")
             if pid in seen_ids:
@@ -243,6 +282,11 @@ async def search_places(latitude: float, longitude: float, radius_km: float = 30
     places.sort(key=lambda x: -(float(x.get("rating") or 0)))
 
     lines = [f"Found {len(places)} spots within {radius_km}km of ({latitude}, {longitude}) [queried {len(grid)} points]:\n"]
+    if failures:
+        lines.append(
+            f"WARNING: {len(failures)} of {len(grid)} query points failed, so this list is "
+            f"incomplete. First error: {failures[0]}\n"
+        )
     for i, p in enumerate(places[:50], 1):
         rating = f"★{p['rating']}" if p.get("rating") else "no rating"
         reviews = f"({p['num_reviews']} reviews)" if p.get("num_reviews") else ""
@@ -287,9 +331,13 @@ async def search_along_route(
     seen_ids = set()
     all_places = []
 
+    failures = []
+
     async with httpx.AsyncClient(timeout=TIMEOUT, headers=HEADERS) as client:
         for idx, (lat, lon) in enumerate(points):
-            raw_places = await _fetch_around(client, lat, lon, corridor_km)
+            raw_places, error = await _fetch_around(client, lat, lon, corridor_km)
+            if error:
+                failures.append(error)
 
             for p in raw_places:
                 pid = p.get("id")
@@ -309,6 +357,9 @@ async def search_along_route(
                 except (ValueError, TypeError):
                     continue
 
+    if failures and len(failures) == len(points):
+        return _upstream_failure_message(failures, len(points))
+
     all_places.sort(key=lambda x: (x["route_segment"], -(float(x.get("rating") or 0))))
 
     total_dist = _haversine(start_lat, start_lon, end_lat, end_lon)
@@ -318,6 +369,11 @@ async def search_along_route(
         f"Distance: ~{round(total_dist)}km | Searched {len(points)} points every {step_km}km | Corridor: +/-{corridor_km}km",
         f"Found **{len(all_places)}** unique spots:\n",
     ]
+    if failures:
+        lines.append(
+            f"WARNING: {len(failures)} of {len(points)} route points failed, so this list is "
+            f"incomplete. First error: {failures[0]}\n"
+        )
 
     current_segment = -1
     count = 0
@@ -354,12 +410,28 @@ async def get_reviews(place_id: int) -> str:
         place_id: The Park4Night place ID (from search results)
     """
     async with httpx.AsyncClient(timeout=TIMEOUT, headers=HEADERS) as client:
-        resp = await client.get(
-            API_REVIEWS,
-            params={"lieu_id": place_id},
+        try:
+            resp = await client.get(
+                API_REVIEWS,
+                params={"lieu_id": place_id},
+            )
+        except Exception as e:
+            return f"Park4Night API error: review request for place {place_id} failed: {type(e).__name__}: {e}"
+
+    if resp.status_code != 200:
+        return (
+            f"Park4Night API error: HTTP {resp.status_code} when fetching reviews for place "
+            f"{place_id}. This is an upstream problem — it does NOT mean the spot has no reviews."
         )
-        resp.raise_for_status()
+
+    try:
         raw = resp.json()
+    except Exception as e:
+        snippet = resp.text[:100].replace("\n", " ")
+        return (
+            f"Park4Night API error: could not parse the review response for place {place_id}: "
+            f"{type(e).__name__}: {e} | body starts: {snippet!r}"
+        )
 
     # Handle both list and dict responses
     if isinstance(raw, dict):
