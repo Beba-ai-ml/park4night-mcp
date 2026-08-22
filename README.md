@@ -128,6 +128,7 @@ The website API returns base64-encoded JSON (not the same as the guest API). The
 - **No secrets, no auth.** The server only reads public, unauthenticated Park4Night endpoints — there are no API keys or credentials anywhere in this repo.
 - **Untrusted upstream content.** Spot descriptions and reviews are user-generated content from Park4Night and are passed to the LLM verbatim. Treat them as untrusted input (a possible prompt-injection vector), exactly as you would any other web content.
 - **Rate-limit friendly.** `step_km` is floored at 5 km and the route point count is capped at 200, so a single call can't accidentally fan out into thousands of sequential requests against the upstream API.
+- **Upstream bot filtering.** Park4Night rejects requests carrying httpx's default anonymous User-Agent with `403 Forbidden`, so the server sends an identifying User-Agent naming this client and linking the repository. If the endpoints start refusing again, the tools now say so explicitly instead of reporting `Found 0 spots` — an empty result means the area really is empty, and an API problem is labelled as one.
 
 ## License
 
