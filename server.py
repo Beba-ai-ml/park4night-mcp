@@ -27,6 +27,8 @@ mcp = FastMCP(
 API_AROUND = "https://park4night.com/api/places/around"
 API_REVIEWS = "https://guest.park4night.com/services/V4.1/commGet.php"
 TIMEOUT = 15.0
+# park4night.com 403s the httpx default UA ("python-httpx/...") — needs a browser UA
+HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}
 
 # Park4Night place type codes
 TYPE_CODES = {
@@ -211,7 +213,7 @@ async def search_places(latitude: float, longitude: float, radius_km: float = 30
     seen_ids = set()
     places = []
 
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=TIMEOUT, headers=HEADERS) as client:
         tasks = [_fetch_around(client, lat, lon, radius_km) for lat, lon in grid]
         results = await asyncio.gather(*tasks)
 
@@ -279,7 +281,7 @@ async def search_along_route(
     seen_ids = set()
     all_places = []
 
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=TIMEOUT, headers=HEADERS) as client:
         for idx, (lat, lon) in enumerate(points):
             raw_places = await _fetch_around(client, lat, lon, corridor_km)
 
@@ -345,7 +347,7 @@ async def get_reviews(place_id: int) -> str:
     Args:
         place_id: The Park4Night place ID (from search results)
     """
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=TIMEOUT, headers=HEADERS) as client:
         resp = await client.get(
             API_REVIEWS,
             params={"lieu_id": place_id},
